@@ -5,9 +5,11 @@ Ubuntu 24.04 host, mirroring the routes from the existing gateway (192.168.1.100
 with **no plugins**.
 
 This is the DB-mode companion to [`kong-dbless-install.md`](kong-dbless-install.md).
-Same Kong version, same 9 services/routes, same ports — the difference is that
-config lives in Postgres and can be changed live through the Admin API (or decK)
-without restarting Kong.
+Same Kong version, same 9 services/routes, same ports, and **the same
+`/opt/kong/kong.yml` file is still the source of truth**. The difference is that
+Kong stores its config in Postgres, and [decK](https://docs.konghq.com/deck/)
+syncs `kong.yml` into the database. You edit the YAML and run one command. You
+don't use curl and you don't restart Kong.
 
 ---
 
@@ -15,7 +17,10 @@ without restarting Kong.
 
 - Kong **3.9.4** community, running as a Docker container
 - **PostgreSQL 16** in a second container (`kong-db`), data on a named volume
-- **DB mode**: config stored in Postgres; changes via Admin API take effect immediately
+- **DB mode**: Kong reads its config from Postgres
+- **`/opt/kong/kong.yml` is the source of truth**: services, routes, plugins, and
+  consumers are all defined there and pushed with decK (`kong-apply.sh apply`).
+  Changes go live immediately, with no Kong restart.
 - 9 services + 9 routes (notes, jenkins, k8s, dvga, juice-shop, vampi, juice-nomon, mailhog, crapi)
 - **No plugins** installed/configured
 - Host ports: **80** (proxy), **8000** (proxy), **8001** (admin API)
@@ -152,15 +157,31 @@ docker run -d \
 | `--restart unless-stopped` | Survives reboots (both containers) |
 
 > **Security note:** in DB mode the Admin API can **change** the live config,
-> not just read it. Only expose 8001 on a trusted LAN (or bind it to
-> `127.0.0.1:8001` and use SSH tunnelling).
+> not just read it. Only expose 8001 on a trusted LAN. decK runs on this host
+> and talks to `localhost:8001`, so you can also publish it as
+> `-p 127.0.0.1:8001:8001` to keep it off the LAN entirely.
 
 ---
 
-## 7. Load the services and routes
+## 7. Install decK
 
-In DB mode the config goes into Postgres. Write the same declarative file used
-by the DBLESS guide, then import it **once** into the database.
+decK is a single binary. It reads `kong.yml`, compares it with what's in Kong,
+and creates, updates, or deletes entities through the Admin API so that Kong
+matches the file exactly.
+
+```bash
+DECK_VERSION=1.69.0
+curl -sL "https://github.com/Kong/deck/releases/download/v${DECK_VERSION}/deck_${DECK_VERSION}_linux_amd64.tar.gz" \
+  | sudo tar -xz -C /usr/local/bin deck
+deck version
+```
+
+---
+
+## 8. Write `kong.yml` (the source of truth)
+
+This is the same declarative file the DBLESS guide uses. In DB mode it is not
+mounted into the container. decK pushes it into the database instead.
 
 ```bash
 sudo mkdir -p /opt/kong
@@ -364,25 +385,60 @@ services:
         https_redirect_status_code: 426
 ```
 
-Import it into the database (uses a throwaway Kong container on the same network):
+---
+
+## 9. Create the apply script and push the config
+
+`/opt/kong/kong-apply.sh` wraps decK so every change follows the same steps:
+validate, back up the current state, then sync. Run `diff` first to preview.
 
 ```bash
-docker run --rm \
-  --network kongnet \
-  -v /opt/kong/kong.yml:/tmp/kong.yml:ro \
-  -e KONG_DATABASE=postgres \
-  -e KONG_PG_HOST=kong-db \
-  -e KONG_PG_USER=kong \
-  -e KONG_PG_PASSWORD="$(cat ~/.kong-db-password)" \
-  kong:3.9.4 kong config db_import /tmp/kong.yml
+cat > /opt/kong/kong-apply.sh <<'EOF'
+#!/usr/bin/env bash
+# Make Kong (DB mode) match /opt/kong/kong.yml exactly.
+#   kong-apply.sh validate   check the YAML against the running Kong
+#   kong-apply.sh diff       show what would change (no changes made)
+#   kong-apply.sh apply      validate + backup + sync (prints every change)
+#   kong-apply.sh backup     dump current Kong state to ~/kong-backups/
+#   kong-apply.sh restore F  sync a backup file back into Kong
+set -euo pipefail
+KONG_YML=${KONG_YML:-/opt/kong/kong.yml}
+KONG_ADDR=${KONG_ADDR:-http://localhost:8001}
+BACKUP_DIR=${BACKUP_DIR:-$HOME/kong-backups}
+D="--kong-addr $KONG_ADDR"
+
+backup() {
+  mkdir -p "$BACKUP_DIR"
+  f="$BACKUP_DIR/kong-$(date +%F-%H%M%S).yaml"
+  deck gateway dump $D -o "$f" --yes >/dev/null
+  echo "backup: $f"
+}
+
+case "${1:-}" in
+  validate) deck gateway validate $D "$KONG_YML" ;;
+  diff)     deck gateway diff $D "$KONG_YML" ;;
+  apply)    deck gateway validate $D "$KONG_YML"
+            backup
+            deck gateway sync $D "$KONG_YML" ;;
+  backup)   backup ;;
+  restore)  [ -n "${2:-}" ] || { echo "usage: $0 restore FILE"; exit 1; }
+            backup
+            deck gateway sync $D "$2" ;;
+  *) sed -n '2,8p' "$0"; exit 1 ;;
+esac
+EOF
+chmod +x /opt/kong/kong-apply.sh
 ```
 
-No restart is needed — the running Kong picks up the new entities from the
-database automatically (within a few seconds).
+Do the first apply. It creates all 9 services and routes in the empty database:
 
-> **Note:** `db_import` is meant for loading an **empty** database. Running it
-> again on top of existing entities will fail on duplicate names. For ongoing
-> changes use the Admin API or decK (section 9).
+```bash
+/opt/kong/kong-apply.sh apply
+```
+
+Expect `Summary: Created: 18  Updated: 0  Deleted: 0` (9 services and 9 routes).
+The running Kong picks the change up from the database within a few seconds,
+with no restart.
 
 > **Tip:** if you're copying config from an existing (DB-mode) Kong, pull it
 > from its Admin API first:
@@ -394,11 +450,12 @@ database automatically (within a few seconds).
 > curl -s http://OLD_HOST:8001/upstreams
 > ```
 >
-> or, with decK installed: `deck gateway dump --kong-addr http://OLD_HOST:8001 -o old.yaml`
+> or, easier, let decK export it as ready-to-use YAML:
+> `deck gateway dump --kong-addr http://OLD_HOST:8001 -o old.yaml`
 
 ---
 
-## 8. Verify
+## 10. Verify
 
 ```bash
 # Health (wait until "healthy") — both containers
@@ -444,48 +501,106 @@ crapi -> 200
 
 ---
 
-## 9. Day-2 operations
+## 11. Day-2 operations: edit the YAML, then apply
 
 ```bash
 docker logs kong --tail 50          # access + error logs
 docker logs kong-db --tail 50       # postgres logs
-docker restart kong                 # rarely needed in DB mode
 docker inspect kong --format '{{.State.Health.Status}}'
 ```
 
-**To add/change a route** — no restart needed, changes are live immediately.
-
-Option A, Admin API:
+**Every change (routes, services, plugins, consumers) follows the same steps:**
 
 ```bash
-# add a service + route
-curl -s -X POST http://localhost:8001/services \
-  -d name=example -d url=http://192.168.1.50:8080
-curl -s -X POST http://localhost:8001/services/example/routes \
-  -d name=example-root -d 'hosts[]=example.cropseyit.com' -d 'paths[]=/' \
-  -d strip_path=false -d preserve_host=true
-
-# change an upstream port
-curl -s -X PATCH http://localhost:8001/services/example -d port=8081
-
-# delete
-curl -s -X DELETE http://localhost:8001/routes/example-root
-curl -s -X DELETE http://localhost:8001/services/example
+vi /opt/kong/kong.yml               # 1. edit the source of truth
+/opt/kong/kong-apply.sh diff        # 2. preview (nothing is changed yet)
+/opt/kong/kong-apply.sh apply       # 3. backup + push; live immediately, no restart
 ```
 
-Option B, decK (keeps a YAML file as source of truth):
+> **Important: `apply` is a FULL sync.** Anything in Kong that isn't in
+> `kong.yml` gets **deleted**. Don't make changes with curl or Kong Manager;
+> they'll be wiped on the next apply. If you have to fix something by hand in
+> an emergency, copy the change into `kong.yml` afterwards.
+
+### Example: add a service and route
+
+Append under `services:` in `kong.yml`:
+
+```yaml
+  - name: example
+    host: 192.168.1.50
+    port: 8080
+    protocol: http
+    routes:
+      - name: example-root
+        hosts:
+          - example.cropseyit.com
+        paths:
+          - /
+        strip_path: false
+        preserve_host: true
+```
+
+### Example: remove a route or service
+
+Delete its block from `kong.yml` and run `apply`. decK deletes it from Kong.
+
+### Example: add plugins
+
+Plugins are YAML as well. A plugin can belong to one service, or be global
+(top-level `plugins:` key):
+
+```yaml
+services:
+  - name: juice-shop
+    # ...existing fields...
+    plugins:
+      - name: rate-limiting        # applies to this service only
+        config:
+          minute: 60
+          policy: local
+
+plugins:                           # top-level = global, applies to all traffic
+  - name: correlation-id
+    config:
+      header_name: X-Request-ID
+      generator: uuid
+      echo_downstream: true
+```
+
+Bundled plugins (rate-limiting, key-auth, cors, etc.) work without any other
+setup. A **custom** plugin (such as `nonamesecurity`) also has to be in the
+image and enabled with `KONG_PLUGINS=bundled,<name>` on the `kong` container
+before decK can configure it.
+
+### Secrets in `kong.yml`
+
+If `kong.yml` is committed to git, don't put secrets (API keys, credentials) in
+it directly. decK can read them from environment variables that start with `DECK_`:
+
+```yaml
+    config:
+      api_key: ${{ env "DECK_UPSTREAM_API_KEY" }}
+```
 
 ```bash
-deck gateway dump --kong-addr http://localhost:8001 -o kong.yaml   # export current state
-# ...edit kong.yaml...
-deck gateway diff --kong-addr http://localhost:8001 kong.yaml      # preview
-deck gateway sync --kong-addr http://localhost:8001 kong.yaml      # apply (FULL sync — deletes anything not in the file)
+DECK_UPSTREAM_API_KEY=... /opt/kong/kong-apply.sh apply
 ```
 
-Pick one approach per gateway: if you manage it with decK, don't make ad-hoc
-`curl` changes, or the next `sync` will delete them.
+### Roll back
 
-### Backup / restore the database
+Every `apply` (and `restore`) saves the state from just before it ran. To undo
+a change, restore the newest backup taken before that change:
+
+```bash
+ls ~/kong-backups/
+/opt/kong/kong-apply.sh restore ~/kong-backups/kong-YYYY-MM-DD-HHMMSS.yaml
+```
+
+### Backup / restore the database (full Postgres dump)
+
+`kong.yml` and `~/kong-backups/` already cover the Kong config. A database dump
+also captures anything outside decK's scope:
 
 ```bash
 # backup
@@ -506,7 +621,10 @@ gunzip -c ~/kong-db-YYYY-MM-DD.sql.gz | docker exec -i kong-db psql -U kong kong
 | Kong container keeps restarting, logs say `Database needs bootstrapping` | Skipped step 5 — run `kong migrations bootstrap` |
 | `connection refused` / `could not resolve kong-db` in Kong logs | Kong not on `kongnet`, or `kong-db` not running/healthy yet |
 | `password authentication failed for user "kong"` | Password mismatch. Postgres only reads `POSTGRES_PASSWORD` on the **first** start of an empty volume — if you regenerated `~/.kong-db-password` later, either reset it in Postgres or recreate the volume |
-| `db_import` fails with `UNIQUE violation` | Entities already exist — use the Admin API / decK for changes, not a second import |
+| A route/plugin you added with curl disappeared | `kong-apply.sh apply` is a full sync, so it removes anything not in `kong.yml`. Add the route or plugin to the YAML |
+| decK: `error connecting to Kong` | Kong isn't up yet, or the Admin API isn't on `localhost:8001` (set `KONG_ADDR=http://HOST:8001`) |
+| decK: `plugin 'X' not enabled` / schema error | Custom plugin isn't in the image or `KONG_PLUGINS`, or there's a typo in the plugin `config` |
+| `apply` shows unexpected deletes | Something was changed outside the YAML. Stop and copy it into `kong.yml` first if you want to keep it |
 | `503 service_unavailable` | Route matched but upstream host:port wrong/unreachable — check the service entry and network reachability from the Kong host |
 | `404` on a known domain | Route has no matching `hosts` entry |
 | All routes answer for any Host | `hosts` list missing on the routes |
@@ -526,11 +644,12 @@ docker network rm kongnet
 | | DBLESS (`kong-dbless-install.md`) | DB mode (this guide) |
 |---|---|---|
 | Containers | `kong` | `kong` + `kong-db` (Postgres 16) |
-| Config source | `/opt/kong/kong.yml` mounted read-only | Postgres (`kong-db-data` volume) |
-| Change config | edit YAML + `docker restart kong` | Admin API / decK, live, no restart |
-| Admin API writes | read-only | full read/write |
-| Extra steps | none | network, DB password, `migrations bootstrap`, one-time `db_import` |
-| Backups | copy the YAML | `pg_dump` (or `deck gateway dump`) |
+| Source of truth | `/opt/kong/kong.yml` | `/opt/kong/kong.yml` (same file) |
+| How config reaches Kong | mounted read-only, loaded at startup | decK syncs it into Postgres |
+| Change config | edit YAML + `docker restart kong` | edit YAML + `kong-apply.sh apply` (live, no restart) |
+| Plugins with DB-only features (e.g. `rate-limiting` `policy: cluster`) | not available | available |
+| Extra steps | none | network, DB password, `migrations bootstrap`, decK |
+| Backups | copy the YAML | YAML + automatic `~/kong-backups/` on every apply (+ optional `pg_dump`) |
 
 ---
 
