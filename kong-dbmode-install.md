@@ -4,6 +4,9 @@ Step-by-step guide for installing Kong in **DB mode** (backed by PostgreSQL) on 
 Ubuntu 24.04 host, mirroring the routes from the existing gateway (192.168.1.100),
 with **no plugins**.
 
+Verified working on **192.168.1.91** (ubuntu-1, Nov 2026). Every command below was
+run as written.
+
 This is the DB-mode companion to [`kong-dbless-install.md`](kong-dbless-install.md).
 Same Kong version, same 9 services/routes, same ports, and **the same
 `/opt/kong/kong.yml` file is still the source of truth**. The difference is that
@@ -20,7 +23,7 @@ don't use curl and you don't restart Kong.
 - **DB mode**: Kong reads its config from Postgres
 - **`/opt/kong/kong.yml` is the source of truth**: services, routes, plugins, and
   consumers are all defined there and pushed with decK (`kong-apply.sh apply`).
-  Changes go live immediately, with no Kong restart.
+  Changes reach the proxy within about 5 seconds, with no Kong restart.
 - 9 services + 9 routes (notes, jenkins, k8s, dvga, juice-shop, vampi, juice-nomon, mailhog, crapi)
 - **No plugins** installed/configured
 - Host ports: **80** (proxy), **8000** (proxy), **8001** (admin API)
@@ -185,8 +188,7 @@ mounted into the container. decK pushes it into the database instead.
 
 ```bash
 sudo mkdir -p /opt/kong
-sudo touch /opt/kong/kong.yml
-sudo chown $USER /opt/kong/kong.yml   # so you can edit it without sudo
+sudo chown -R $USER:$USER /opt/kong  # you own the dir: edit kong.yml + create kong-apply.sh without sudo
 ```
 
 Write `/opt/kong/kong.yml`:
@@ -424,7 +426,7 @@ case "${1:-}" in
   restore)  [ -n "${2:-}" ] || { echo "usage: $0 restore FILE"; exit 1; }
             backup
             deck gateway sync $D "$2" ;;
-  *) sed -n '2,8p' "$0"; exit 1 ;;
+  *) sed -n '2,7p' "$0"; exit 1 ;;
 esac
 EOF
 chmod +x /opt/kong/kong-apply.sh
@@ -437,8 +439,9 @@ Do the first apply. It creates all 9 services and routes in the empty database:
 ```
 
 Expect `Summary: Created: 18  Updated: 0  Deleted: 0` (9 services and 9 routes).
-The running Kong picks the change up from the database within a few seconds,
-with no restart.
+Each Kong worker checks the database for changes every 5 seconds
+(`KONG_WORKER_STATE_UPDATE_FREQUENCY`, default 5), so a change can take up to
+about 5 seconds to reach the proxy. No restart is needed.
 
 > **Tip:** if you're copying config from an existing (DB-mode) Kong, pull it
 > from its Admin API first:
@@ -514,7 +517,7 @@ docker inspect kong --format '{{.State.Health.Status}}'
 ```bash
 vi /opt/kong/kong.yml               # 1. edit the source of truth
 /opt/kong/kong-apply.sh diff        # 2. preview (nothing is changed yet)
-/opt/kong/kong-apply.sh apply       # 3. backup + push; live immediately, no restart
+/opt/kong/kong-apply.sh apply       # 3. backup + push; live in ~5s, no restart
 ```
 
 > **Important: `apply` is a FULL sync.** Anything in Kong that isn't in
@@ -622,6 +625,7 @@ gunzip -c ~/kong-db-YYYY-MM-DD.sql.gz | docker exec -i kong-db psql -U kong kong
 | `connection refused` / `could not resolve kong-db` in Kong logs | Kong not on `kongnet`, or `kong-db` not running/healthy yet |
 | `password authentication failed for user "kong"` | Password mismatch. Postgres only reads `POSTGRES_PASSWORD` on the **first** start of an empty volume — if you regenerated `~/.kong-db-password` later, either reset it in Postgres or recreate the volume |
 | A route/plugin you added with curl disappeared | `kong-apply.sh apply` is a full sync, so it removes anything not in `kong.yml`. Add the route or plugin to the YAML |
+| Right after `apply`, the old route/plugin still answers for a few seconds | Normal in DB mode: workers pick up changes within ~5 s. Wait and retry |
 | decK: `error connecting to Kong` | Kong isn't up yet, or the Admin API isn't on `localhost:8001` (set `KONG_ADDR=http://HOST:8001`) |
 | decK: `plugin 'X' not enabled` / schema error | Custom plugin isn't in the image or `KONG_PLUGINS`, or there's a typo in the plugin `config` |
 | `apply` shows unexpected deletes | Something was changed outside the YAML. Stop and copy it into `kong.yml` first if you want to keep it |
