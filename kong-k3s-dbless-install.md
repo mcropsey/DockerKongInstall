@@ -496,11 +496,11 @@ kubectl apply -k .                # new ConfigMap hash, so a rolling restart
 kubectl -n kong rollout status deploy/kong
 ```
 
-Optional: validate before applying (from any host with Docker):
+Optional: validate before applying (ubuntu-1 has Docker):
 
 ```bash
 docker run --rm -v "$PWD:/k" -e KONG_DATABASE=off kong:3.9.4 kong config parse /k/kong.yml
-# prints "parse successful". On an SELinux host (Rocky/RHEL) use -v "$PWD:/k:Z"
+# prints "parse successful"
 ```
 
 ---
