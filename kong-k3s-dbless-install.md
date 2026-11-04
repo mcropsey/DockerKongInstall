@@ -17,7 +17,6 @@ Verified working on the k3s cluster **192.168.1.91 / .92 / .93** (Nov 2026).
 - **DBLESS** mode: no Postgres. The config is one YAML file (`kong.yml`), mounted from a ConfigMap.
 - 9 services + 9 routes (crapi, mailhog, dvga, jenkins, juice-nomon, juice-shop, k8s, notes, vampi)
 - **rate-limiting** on every service (1000/min, 20000/hour, per client IP), the same as .100
-- **No Noname plugin** (see section 9)
 - Proxy on **NodePort 30080** (http) / **30443** (https) on *every* node
 - The Admin API is **cluster-internal only** (reach it with `kubectl port-forward`)
 
@@ -61,12 +60,10 @@ All the files below go in this directory.
 
 ## 3. Write `kong.yml` (the declarative config)
 
-These are the 9 services/routes and rate limits from a live `deck gateway dump` of .100
-(2026-11-03), with the Noname plugin removed:
+These are the 9 services/routes and rate limits from the live config on .100 (2026-11-03):
 
 ```yaml
 # Kong 3.9.4 DB-less config. Services/routes/rate limits mirror .100 (live decK dump 2026-11-03).
-# The Noname plugin is NOT included (stock kong image).
 _format_version: '3.0'
 services:
 - name: crapi-app
@@ -260,15 +257,11 @@ services:
       fault_tolerant: true
 ```
 
-To check the routes against .100 again later (run on .100), compare its services/routes
-with this file:
+To compare against .100's routes later:
 
 ```bash
-deck gateway dump --kong-addr http://localhost:8001 -o - | grep -v NN_SOURCE_KEY
+curl -s http://192.168.1.100:8001/routes | python3 -c "import json,sys;[print(r['name'], r['hosts']) for r in json.load(sys.stdin)['data']]"
 ```
-
-> The `NN_SOURCE_KEY` filter matters: a dump of .100 includes the Noname source key in
-> plain text. Never commit it.
 
 ---
 
@@ -472,10 +465,6 @@ curl -s -H 'Host: nope.example' http://192.168.1.92:30080/
 
 ## 9. Things to know
 
-- **No Noname plugin.** .100 runs a global `nonamesecurity` plugin. Adding it here would need
-  the custom `kong-noname:3.9.4` image on every node (e.g. `docker save | sudo k3s ctr images import -`),
-  `KONG_PLUGINS=bundled,nonamesecurity`, and the plugin block in `kong.yml`. That image contains
-  the source key, so never push it to a registry, and never commit a `kong.yml` that holds the key.
 - **The Admin API is read-only in DBLESS mode.** Changes go through `kong.yml` plus `kubectl apply -k .`,
   not `curl -X POST`.
 - **Rate limits are counted per pod** (`policy: local`). With 2 replicas, one client can get up to
